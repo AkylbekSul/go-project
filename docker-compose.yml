@@ -1,0 +1,198 @@
+services:
+  # Single PostgreSQL instance with multiple databases (one per service)
+  postgres:
+    image: postgres:15-alpine
+    container_name: payment_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/create_databases.sql:/docker-entrypoint-initdb.d/create_databases.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: payment_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: payment_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: payment_kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  nats:
+    image: nats:latest
+    container_name: payment_nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js", "-m", "8222"]
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: payment_jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "4318:4318"    # OTLP HTTP receiver
+      - "14268:14268"  # Jaeger collector HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: payment_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: payment_grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: api_gateway
+    environment:
+      DATABASE_URL: ${DATABASE_URL_API_GATEWAY:-postgres://postgres:postgres@postgres:5432/api_gateway_db?sslmode=disable}
+      REDIS_URL: ${REDIS_URL:-redis:6379}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:29092}
+      JAEGER_ENDPOINT: ${JAEGER_ENDPOINT:-jaeger:4318}
+      PORT: ${PORT_API_GATEWAY:-8081}
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+
+  payment-orchestrator:
+    build:
+      context: ./services/payment-orchestrator
+      dockerfile: Dockerfile
+    container_name: payment_orchestrator
+    environment:
+      DATABASE_URL: ${DATABASE_URL_PAYMENT_ORCHESTRATOR:-postgres://postgres:postgres@postgres:5432/payment_orchestrator_db?sslmode=disable}
+      REDIS_URL: ${REDIS_URL:-redis:6379}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:29092}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      JAEGER_ENDPOINT: ${JAEGER_ENDPOINT:-jaeger:4318}
+      PORT: ${PORT_PAYMENT_ORCHESTRATOR:-8082}
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      nats:
+        condition: service_started
+      jaeger:
+        condition: service_started
+
+  fraud-service:
+    build:
+      context: ./services/fraud-service
+      dockerfile: Dockerfile
+    container_name: fraud_service
+    environment:
+      DATABASE_URL: ${DATABASE_URL_FRAUD_SERVICE:-postgres://postgres:postgres@postgres:5432/fraud_service_db?sslmode=disable}
+      REDIS_URL: ${REDIS_URL:-redis:6379}
+      NATS_URL: ${NATS_URL:-nats://nats:4222}
+      JAEGER_ENDPOINT: ${JAEGER_ENDPOINT:-jaeger:4318}
+      PORT: ${PORT_FRAUD_SERVICE:-8083}
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_started
+      jaeger:
+        condition: service_started
+
+  ledger-service:
+    build:
+      context: ./services/ledger-service
+      dockerfile: Dockerfile
+    container_name: ledger_service
+    environment:
+      DATABASE_URL: ${DATABASE_URL_LEDGER_SERVICE:-postgres://postgres:postgres@postgres:5432/ledger_service_db?sslmode=disable}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:29092}
+      JAEGER_ENDPOINT: ${JAEGER_ENDPOINT:-jaeger:4318}
+      PORT: ${PORT_LEDGER_SERVICE:-8084}
+    ports:
+      - "8084:8084"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  grafana_data:
